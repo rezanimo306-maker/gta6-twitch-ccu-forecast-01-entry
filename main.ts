@@ -1,25 +1,33 @@
-// main.ts — Forecast GTA VI's launch-day Twitch viewers hour by hour.
+// main.ts — Forecast GTA VI's launch-day Twitch viewers hour by hour (round 2).
 //
-// Approach (validated by leave-one-launch-out over 37 past launches + the
-// 4 practice cases; see README.md for the numbers):
-//   The launch-day audience curve is NOT one shape: how much Twitch
-//   viewership grows after hour 1 depends overwhelmingly on how big hour 1
-//   already is. A launch whose hour-1 print is tiny (a few hundred viewers
-//   — almost nobody unlocked yet at 00:00 UTC) can grow 100-2000x by the
-//   evening; a launch whose hour 1 is already ~500k (most of the world
-//   unlocked, PC + consoles) stays flat or decays. So every forecast is
-//   conditioned on ln(hour-1 print):
-//     A) per hour, a quadratic regression of ln(viewers(h)/viewers(1)) on
-//        ln(viewers(1)) across the case's comparables, with empirical
-//        residual quantiles for the spread (captures the smooth size law);
-//     B) the 8 nearest comparables by |ln h1 - ln p1|, normal quantiles
-//        from their log-ratios (anchors on launches actually similar in
-//        size to this one);
-//   The forecast is the geometric mean of A and B per quantile. If either
-//   component lacks data for an hour it falls back to the house baseline
-//   shape for that hour. Pure function of the input case: no clock, no
-//   network, no randomness, no model calls. Deterministic byte-identical
-//   outputs across runs.
+// Revision of round 1 ("Size-Law CCU Forecaster"). Same two-component core,
+// plus four changes, each validated by leave-one-launch-out over 37 past
+// launches + the 4 practice cases (see README.md for the numbers):
+//   1) Rolling-midnight unlock shift. Launches that unlock at local midnight
+//      in each timezone ramp harder through the day than simultaneous-global
+//      unlocks at the same hour-1 size: after the size regression, rolling
+//      launches sit ~0.3 log units above simultaneous ones in the evening
+//      (partial correlation +0.34 given ln hour-1). So each hour's forecast
+//      is shifted by 80% of the rolling-vs-simultaneous residual gap,
+//      signed by whether THIS case's unlock is rolling (read from the case's
+//      notes; GTA VI unlocks at rolling midnight local).
+//   2) Tighter spread where the band was over-wide. Practice coverage was
+//      1.000 on 3 of 4 cases and LOLO coverage 0.97 at hour-1 >= 50k, so the
+//      spread is shrunk to 0.8x at hour-1 >= 100k (ramping in log space
+//      from 20k) and widened to 1.15x at hour-1 <= 5k (where coverage was
+//      0.81, slightly under-covered).
+//   3) Tangent extrapolation past the data edge. Round 1 clamped the
+//      regression to the largest observed hour-1 (~875k); GTA VI's hour-1
+//      may exceed that, so beyond the edge the forecast now follows the
+//      regression's local slope, with the extra move capped at 0.5 in log
+//      space. The slope at the top edge is small and negative (bigger
+//      launches grow less), so this is a gentle, safe extension.
+//   4) Median shrink toward flat at very high hour-1 (300k..1M ramp, 20%):
+//      the biggest launches' evenings are flatter than the size law alone
+//      predicts.
+// The blend now weights the regression component 0.6 / neighbours 0.4
+// (was 0.5/0.5). Pure function of the input case: no clock, no network, no
+// randomness, no model calls. Deterministic byte-identical outputs.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -27,10 +35,19 @@ import * as path from "node:path";
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
 
+// Round-2 tuning (see README.md for the validation table).
+const ALPHA = 0.6; // weight of the regression component in the geometric blend
+const KNN_K = 8;
+const SHRINK_HI = 0.8; // spread multiplier at hour-1 >= 100k
+const WIDEN_LO = 1.15; // spread multiplier at hour-1 <= 5k
+const ROLL_SHIFT = 0.8; // fraction of the rolling-vs-simultaneous gap applied
+const SHRINK_HI_MED = 0.2; // median shrink toward flat, hour-1 300k..1M ramp
+
 interface Comparable {
   name: string;
   h1: number;
   curve: Map<number, number>; // release-day UTC hour (1..24) -> mean viewers
+  rolling: boolean; // rolling-midnight unlock (vs simultaneous global unlock)
 }
 
 function round2(x: number): number {
@@ -76,12 +93,25 @@ function releaseDayCurve(comp: any): Map<number, number> | null {
   return curve;
 }
 
+/** Rolling-midnight unlock? The unlock text says "rolling" or "midnight local". */
+function isRolling(text: unknown): boolean {
+  if (typeof text !== "string") return false;
+  const t = text.toLowerCase();
+  return t.includes("rolling") || t.includes("midnight local");
+}
+
+interface QuadFit {
+  pred: (x: number) => number;
+  slope: (x: number) => number;
+  mx: number;
+}
+
 /**
  * Least-squares quadratic fit y ~ c0 + c1*(x-mx) + c2*(x-mx)^2, solved by
  * Gaussian elimination with partial pivoting. Returns null when there are
  * too few points or the system is singular.
  */
-function quadFit(xs: number[], ys: number[]): ((x: number) => number) | null {
+function quadFit(xs: number[], ys: number[]): QuadFit | null {
   const n = xs.length;
   if (n < 8) return null;
   const mx = xs.reduce((a, b) => a + b, 0) / n;
@@ -119,21 +149,46 @@ function quadFit(xs: number[], ys: number[]): ((x: number) => number) | null {
     c[i] = s / a[i][i];
   }
   if (!c.every(Number.isFinite)) return null;
-  return (x: number) => c[0] + c[1] * (x - mx) + c[2] * (x - mx) * (x - mx);
+  return {
+    pred: (x: number) => c[0] + c[1] * (x - mx) + c[2] * (x - mx) * (x - mx),
+    slope: (x: number) => c[1] + 2 * c[2] * (x - mx),
+    mx,
+  };
+}
+
+/** Spread multiplier: 1.15x at tiny hour-1, 1x mid-range, 0.8x at hour-1 >= 100k. */
+function spreadMultiplier(lnP: number): number {
+  const ln5k = Math.log(5000);
+  const ln20k = Math.log(20000);
+  const ln100k = Math.log(100000);
+  if (lnP >= ln100k) return SHRINK_HI;
+  if (lnP >= ln20k) {
+    const t = (lnP - ln20k) / (ln100k - ln20k);
+    return 1 + (SHRINK_HI - 1) * t;
+  }
+  if (lnP <= ln5k) return WIDEN_LO;
+  const t = (lnP - ln5k) / (ln20k - ln5k);
+  return WIDEN_LO + (1 - WIDEN_LO) * t;
 }
 
 /**
  * Forecast one hour h (2..24) as five quantiles.
  * Component A: quadratic regression of ln(v(h)/v(1)) on ln(v(1)) over the
  *   comparables that have hour h, median predicted at the case's ln(p1)
- *   (clamped to the comparables' observed ln h1 range — never extrapolate
- *   past the data), spread from the empirical quantiles of that hour's
+ *   (tangent-extrapolated past the data edge, extra move capped at 0.5 in
+ *   log space), spread from the empirical quantiles of that hour's
  *   residuals.
  * Component B: the 8 nearest comparables by |ln h1 - ln p1|; their
  *   log-ratios at hour h give a normal median + spread (sd floored at
  *   0.15 so the band never collapses on a few agreeing neighbours).
- * Blend: geometric mean of A and B per level. A component that lacks data
- * for the hour falls back to the house baseline row.
+ * Blend: geometric mean of A and B per level, weight 0.6 on A; the spread
+ *   around the blended median is scaled by spreadMultiplier(lnP).
+ * Then two median adjustments: the rolling-unlock shift (80% of the
+ *   rolling-vs-simultaneous residual gap at this hour, signed by whether
+ *   this case's unlock is rolling) and, at hour-1 >= 300k, a shrink of
+ *   the log-ratio toward flat (0% at 300k, 20% at 1M).
+ * A component that lacks data for the hour falls back to the house
+ *   baseline row.
  */
 function forecastHour(
   p: number,
@@ -142,26 +197,38 @@ function forecastHour(
   h: number,
   lnMin: number,
   lnMax: number,
+  targetRolling: boolean,
 ): number[] {
   const base = houseRow(p, h);
+  const sm = spreadMultiplier(lnP);
 
   let qA: number[] | null = null;
-  const pts: { x: number; r: number }[] = [];
+  let gapFit: QuadFit | null = null;
+  let gapPts: { x: number; r: number; rolling: boolean }[] = [];
+  const pts: { x: number; r: number; rolling: boolean }[] = [];
   for (const c of pool) {
     const v = c.curve.get(h);
     if (v !== undefined && v > 0) {
-      pts.push({ x: Math.log(c.h1), r: Math.log(v / c.h1) });
+      pts.push({ x: Math.log(c.h1), r: Math.log(v / c.h1), rolling: c.rolling });
     }
   }
   if (pts.length >= 8) {
     const xs = pts.map((q) => q.x);
     const ys = pts.map((q) => q.r);
-    const pred = quadFit(xs, ys);
-    if (pred !== null) {
-      const xq = Math.min(Math.max(lnP, lnMin), lnMax);
-      const mu = pred(xq);
-      const resid = ys.map((y, i) => y - pred(xs[i])).sort((a, b) => a - b);
+    const fit = quadFit(xs, ys);
+    if (fit !== null) {
+      let mu: number;
+      if (lnP > lnMax) {
+        mu = fit.pred(lnMax) + fit.slope(lnMax) * Math.min(lnP - lnMax, 0.5);
+      } else if (lnP < lnMin) {
+        mu = fit.pred(lnMin) + fit.slope(lnMin) * Math.max(lnP - lnMin, -0.5);
+      } else {
+        mu = fit.pred(lnP);
+      }
+      const resid = ys.map((y, i) => y - fit.pred(xs[i])).sort((a, b) => a - b);
       qA = LEVELS.map((tau) => p * Math.exp(mu + quantile(resid, tau)));
+      gapFit = fit;
+      gapPts = pts;
     }
   }
 
@@ -172,7 +239,7 @@ function forecastHour(
       if (d !== 0) return d;
       return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
     })
-    .slice(0, 8);
+    .slice(0, KNN_K);
   const rs: number[] = [];
   for (const c of knn) {
     const v = c.curve.get(h);
@@ -189,11 +256,43 @@ function forecastHour(
 
   const a = qA ?? base;
   const b = qB ?? base;
-  let prev = 0;
-  return a.map((v, i) => {
-    let x = Math.sqrt(v * b[i]);
+  const med = Math.exp(ALPHA * Math.log(a[2]) + (1 - ALPHA) * Math.log(b[2]));
+  let row = a.map((v, i) => {
+    const lr = ALPHA * Math.log(a[i] / a[2]) + (1 - ALPHA) * Math.log(b[i] / b[2]);
+    let x = med * Math.exp(lr * sm);
     if (!Number.isFinite(x)) x = p;
-    x = Math.min(Math.max(x, 1), 1e9);
+    return x;
+  });
+
+  // Rolling-unlock shift: rolling launches ramp harder than simultaneous
+  // ones at the same hour-1 size. The gap is the mean quad residual of the
+  // rolling comparables minus that of the simultaneous ones at this hour.
+  if (gapFit !== null && gapPts.length >= 8) {
+    const resR = gapPts.filter((q) => q.rolling).map((q) => q.r - gapFit!.pred(q.x));
+    const resS = gapPts.filter((q) => !q.rolling).map((q) => q.r - gapFit!.pred(q.x));
+    if (resR.length >= 3 && resS.length >= 3) {
+      const gap =
+        resR.reduce((s, v) => s + v, 0) / resR.length -
+        resS.reduce((s, v) => s + v, 0) / resS.length;
+      const pRoll = resR.length / (resR.length + resS.length);
+      const adj = ROLL_SHIFT * gap * (targetRolling ? 1 - pRoll : -pRoll);
+      row = row.map((v) => v * Math.exp(adj));
+    }
+  }
+
+  // Median shrink toward flat at very high hour-1 (300k..1M ramp, up to 20%).
+  const ln300k = Math.log(300000);
+  const ln1m = Math.log(1000000);
+  let t = 0;
+  if (lnP > ln300k) t = lnP >= ln1m ? 1 : (lnP - ln300k) / (ln1m - ln300k);
+  const ms = SHRINK_HI_MED * t;
+  if (ms > 0) {
+    row = row.map((v) => p * Math.exp(Math.log(Math.max(v, 1) / p) * (1 - ms)));
+  }
+
+  let prev = 0;
+  return row.map((v) => {
+    let x = Math.min(Math.max(v, 1), 1e9);
     x = round2(x);
     if (x < prev) x = prev; // keep quantiles non-decreasing
     prev = x;
@@ -211,6 +310,12 @@ function forecastCase(c: any): { hours: { hour: number; q: number[] }[] } {
   if (!Number.isFinite(p) || p < 1) p = 1;
   const lnP = Math.log(p);
 
+  // Rolling-midnight unlock? Read from the case notes; GTA VI unlocks at
+  // rolling midnight local, so a case without notes defaults to rolling.
+  const notes = (c as any).notes;
+  const targetRolling =
+    typeof notes === "string" && notes.length > 0 ? isRolling(notes) : true;
+
   // Comparable pool: needs a real hour-1 print and at least 20 of hours
   // 2..24 on its release day. This drops the GTA VI category itself (no
   // release day yet) and any sparse/unusable launch.
@@ -224,7 +329,7 @@ function forecastCase(c: any): { hours: { hour: number; q: number[] }[] } {
     let nHours = 0;
     for (let h = 2; h <= 24; h++) if (curve.has(h)) nHours++;
     if (nHours < 20) continue;
-    pool.push({ name: String(comp.name ?? ""), h1, curve });
+    pool.push({ name: String(comp.name ?? ""), h1, curve, rolling: isRolling(comp.unlock) });
   }
   const lnH1 = pool.map((x) => Math.log(x.h1));
   const lnMin = lnH1.length > 0 ? Math.min(...lnH1) : lnP;
@@ -232,7 +337,7 @@ function forecastCase(c: any): { hours: { hour: number; q: number[] }[] } {
 
   const hours = [];
   for (let h = 2; h <= 24; h++) {
-    hours.push({ hour: h, q: forecastHour(p, lnP, pool, h, lnMin, lnMax) });
+    hours.push({ hour: h, q: forecastHour(p, lnP, pool, h, lnMin, lnMax, targetRolling) });
   }
   return { hours };
 }
